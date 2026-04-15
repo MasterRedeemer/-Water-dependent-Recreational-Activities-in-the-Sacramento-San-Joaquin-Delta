@@ -34,11 +34,6 @@
 **Required Library Packages for R, for each R-file are at the top of each RMD document**
 ***All scripts are independent from each other, so no need to run in particular order across RMD files***
 
-               
-# R scripts for data cleaning, modeling, and visualization
-
-# Figures, tables, and model outputs used in manuscript
-
 ### Open Research
       **Publicly available datasets include:**
     1. California State Parks Statistical Report (https://www.parks.ca.gov/?page_id=23308), 
