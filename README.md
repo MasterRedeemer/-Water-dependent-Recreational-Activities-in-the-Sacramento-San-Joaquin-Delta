@@ -1,8 +1,8 @@
 # Water dependent Recreational Activities in theSacramento-San Joaquin Delta
-Repository of Data used to make a recreation based Image of the California Sacramento-San Joaquin Delta
-Data By: Jeffrey S. Jenkins and Isaac T. Sanchez
-University of California, Merced
-Department of Management of Complex Systems
+     Repository of Data used to make a recreation based Image of the California Sacramento-San Joaquin Delta
+     Data By: Jeffrey S. Jenkins and Isaac T. Sanchez
+     University of California, Merced
+     Department of Management of Complex Systems
 
 ## Open Research
       **Publicly available datasets include:**
