@@ -27,3 +27,5 @@
   ### This work is open to be used within the confines of CC licensing attached to this repo
         for questions, comments, concerns: reach out to the owner of this repository: isanchezterrazas@ucmerced.edu
         Reflections and data management can help others attain personal as well as professional insights associated with the work that went into this repo
+#### Link to Zenodo or likewise archival software can be found in the link bellow, providing timeless access to these data
+     (work in progress)
