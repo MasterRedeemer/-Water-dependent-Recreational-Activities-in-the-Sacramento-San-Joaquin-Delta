@@ -1,0 +1,815 @@
+---
+title: "Stripped Bass Fisheries"
+author: "See CC Licensing Information"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## 1) Setup:
+
+Excel sheets used for this framework may be found in same folder, make path and should work as simply
+
+Workflow made for significance testing FIGURE 4 in manuscript, supplemental materials not used marked at pane above chunk(s)
+
+```{r setup, include=FALSE}
+
+library(broom)
+library(dplyr)
+library(devEMF)
+library(emmeans)
+library(forcats)
+library(ggplot2)
+library(ggdist)
+library(Hmisc)
+library(kableExtra)
+library(lme4)
+library(lubridate)
+library(officer)
+library(patchwork)
+library(purrr)
+library(readxl)
+library(rlang)
+library(rsvg)
+library(readr)
+library(sandwich)
+library(svglite)
+library(stringr)
+library(tidyr)
+library(zoo)
+library(showtext)
+
+Adult_Bass <- readxl::read_excel("Data//Adult Striped Bass DFW.xlsx", sheet = 1)
+Zero_Age_Bass <- readxl::read_excel("Data//Index 0-age Striped Bass.xlsx", sheet = 1)
+
+```
+
+
+```{r striped bass data clean up}
+
+# hydrology class order
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+
+# Adult striped bass clean
+# Main columns pulled:
+# - release_date
+# - common_name
+# - Weighted Year Type 82/18
+
+adult_bass_clean <- Adult_Bass %>%
+  dplyr::select(
+    release_id = release_ID,
+    release_date = release_date,
+    release_location = release_location,
+    release_method = release_method,
+    common_name = common_name,
+    release_fl_cm = release_FL_cm,
+    sex = sex,
+    age = age,
+    count = count,
+    water_year_date = `water year date`,
+    condition_raw = `Weighted Year Type`
+  ) %>%
+  dplyr::mutate(
+    release_date = as.Date(release_date),
+    year = lubridate::year(release_date),
+    common_name = stringr::str_squish(as.character(common_name)),
+    condition_raw = stringr::str_squish(as.character(condition_raw)),
+    Condition = dplyr::case_when(
+      stringr::str_detect(condition_raw, stringr::regex("Critical|Extreme Drought", ignore_case = TRUE)) ~ "Critical",
+      stringr::str_detect(condition_raw, stringr::regex("^Dry|\\bDry Year\\b", ignore_case = TRUE)) ~ "Dry",
+      stringr::str_detect(condition_raw, stringr::regex("Below Normal", ignore_case = TRUE)) ~ "Below Normal",
+      stringr::str_detect(condition_raw, stringr::regex("Above Normal", ignore_case = TRUE)) ~ "Above Normal",
+      stringr::str_detect(condition_raw, stringr::regex("^Wet|\\bWet Year\\b|Moderate Wet", ignore_case = TRUE)) ~ "Wet",
+      TRUE ~ NA_character_
+    ),
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = TRUE)
+  ) %>%
+  dplyr::filter(common_name == "Striped Bass")
+
+
+# Age-0 striped bass clean
+# Main columns pulled:
+# - YEAR
+# - INDEX DATE
+# - TOTAL INDEX
+# - Unimpaired Weighted Drainage 82/18
+
+age0_bass_clean <- Zero_Age_Bass%>%
+  dplyr::select(
+    year = YEAR,
+    index_date = `INDEX DATE`,
+    delta_index = `DELTA INDEX`,
+    suisun_bay_index = `SUISUN BAY INDEX`,
+    total_index = `TOTAL INDEX`,
+    water_year_date = `Water Year Date`,
+    condition_raw = `Weighted Year Type`
+  ) %>%
+  dplyr::mutate(
+    index_date = suppressWarnings(lubridate::mdy(index_date)),
+    year = as.integer(year),
+    total_index = as.numeric(total_index),
+    condition_raw = stringr::str_squish(as.character(condition_raw)),
+    Condition = dplyr::case_when(
+      stringr::str_detect(condition_raw, stringr::regex("Critical|Extreme Drought", ignore_case = TRUE)) ~ "Critical",
+      stringr::str_detect(condition_raw, stringr::regex("^Dry|\\bDry Year\\b", ignore_case = TRUE)) ~ "Dry",
+      stringr::str_detect(condition_raw, stringr::regex("Below Normal", ignore_case = TRUE)) ~ "Below Normal",
+      stringr::str_detect(condition_raw, stringr::regex("Above Normal", ignore_case = TRUE)) ~ "Above Normal",
+      stringr::str_detect(condition_raw, stringr::regex("^Wet|\\bWet Year\\b|Moderate Wet", ignore_case = TRUE)) ~ "Wet",
+      TRUE ~ NA_character_
+    ),
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = TRUE)
+  )
+
+
+# Quick Checks
+# Check that hydrology classes were standardized correctly
+check_levels <- function(data, name) {
+  cat("\n", name, "\n", sep = "")
+  print(levels(data$Condition))
+  print(table(data$Condition, useNA = "ifany"))
+  invisible(data)
+}
+
+check_levels(adult_bass_clean, "adult_bass_clean")
+check_levels(age0_bass_clean, "age0_bass_clean")
+
+
+
+# Quick checks
+dplyr::glimpse(adult_bass_clean)
+dplyr::glimpse(age0_bass_clean)
+
+#adult_bass_clean %>%
+#  summarise(
+#    n_missing_year = sum(is.na(year)),
+#    n_missing_condition = sum(is.na(Condition)),
+#    n_missing_count = sum(is.na(count))
+#  )
+
+# glimpse(Adult_Bass)
+
+```
+
+
+```{r striped bass parameters and data clean}
+
+# one annual table per striped bass dataset
+# This mirrors the recreation workflow, but removes season and location.
+# We focus on annual response values by hydrology class.
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+
+# Adult striped bass annual table
+# Columns used from cleaned table:
+# - year
+# - release_date
+# - Condition
+
+adult_bass_annual <- adult_bass_clean %>%
+  dplyr::filter(!is.na(year), !is.na(Condition)) %>%
+  dplyr::group_by(year, Condition) %>%
+  dplyr::summarise(
+    Value = sum(count, na.rm = TRUE),
+    Date = as.Date(paste0(year, "-01-01")),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Activity = "Adult Striped Bass",
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = FALSE)
+  )
+
+
+# Age-0 striped bass annual table
+# Columns used from cleaned table:
+# - year
+# - index_date
+# - total_index
+# - Condition
+
+age0_bass_annual <- age0_bass_clean %>%
+  dplyr::filter(!is.na(year), !is.na(total_index), !is.na(Condition)) %>%
+  dplyr::transmute(
+    Activity = "Age-0 Striped Bass",
+    Year = year,
+    Date = dplyr::coalesce(index_date, as.Date(paste0(year, "-01-01"))),
+    Value = as.numeric(total_index),
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = FALSE)
+  )
+
+# Fix column names to match
+adult_bass_annual <- adult_bass_annual %>%
+  dplyr::rename(Year = year)
+
+adult_bass_annual <- adult_bass_clean %>%
+  dplyr::filter(!is.na(year), !is.na(Condition)) %>%
+  dplyr::group_by(year, Condition) %>%
+  dplyr::summarise(
+    Value = sum(count, na.rm = TRUE),
+    Date = as.Date(sprintf("%d-01-01", dplyr::first(year))),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Activity = "Adult Striped Bass",
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = FALSE)
+  ) %>%
+  dplyr::rename(Year = year)
+
+# Bind into one striped bass analysis table
+
+striped_bass_all_raw <- dplyr::bind_rows(
+  adult_bass_annual,
+  age0_bass_annual
+)
+
+striped_bass_all <- striped_bass_all_raw %>%
+  dplyr::filter(
+    !is.na(Activity),
+    !is.na(Year),
+    !is.na(Date),
+    !is.na(Value),
+    !is.na(Condition)
+  ) %>%
+  dplyr::mutate(
+    Activity = factor(
+      Activity,
+      levels = c("Adult Striped Bass", "Age-0 Striped Bass")
+    ),
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = TRUE)
+  )
+
+
+# Quick checks
+tibble::tibble(
+  n_adult_annual = nrow(adult_bass_annual),
+  n_age0_annual = nrow(age0_bass_annual),
+  n_total = nrow(striped_bass_all)
+)
+
+striped_bass_all %>%
+  dplyr::count(Activity, Condition) %>%
+  tidyr::complete(Activity, Condition, fill = list(n = 0))
+
+```
+
+```{r striped bass helper functions, include=FALSE}
+
+# Shared striped bass model helpers
+BASELINE <- "Below Normal"
+EMM_WEIGHTS_GLOBAL <- "equal"
+ROBUST_SE <- TRUE
+HC_TYPE <- "HC3"
+
+vcovHC_psd <- function(mod, type = "HC3") {
+  vc <- sandwich::vcovHC(mod, type = type)
+  vc <- as.matrix(vc)
+  vc <- (vc + t(vc)) / 2
+
+  ev <- tryCatch(
+    eigen(vc, symmetric = TRUE, only.values = TRUE)$values,
+    error = function(e) NA_real_
+  )
+
+  if (any(!is.finite(ev)) || any(ev < -1e-8)) {
+    if (requireNamespace("Matrix", quietly = TRUE)) {
+      vc <- as.matrix(Matrix::nearPD(vc, corr = FALSE)$mat)
+    }
+  }
+
+  vc
+}
+
+safe_emm <- function(model, specs, weights = EMM_WEIGHTS_GLOBAL, at = list()) {
+  if (ROBUST_SE) {
+    vc <- vcovHC_psd(model, type = HC_TYPE)
+    emmeans::emmeans(model, specs, weights = weights, at = at, vcov. = vc)
+  } else {
+    emmeans::emmeans(model, specs, weights = weights, at = at)
+  }
+}
+
+```
+
+##  WITHIN-PERIOD SETUP FOR STRIPED BASS, USED TO MARK SIGNIFICANCE IN FIGURE 4 STRIPED BASS
+
+```{r striped bass period plots with significance}
+
+
+# Striped bass by period:
+# % difference from across-class average
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+
+# Figure knobs
+STAR_COLOR <- "red4"
+STAR_PAD <- 18
+STAR_SIZE <- 8
+
+Y_MIN <- -120
+Y_MAX <- 220
+
+ERRBAR_LWD <- 0.6
+ERRBAR_CAP <- 0.28
+
+POINT_SIZE <- 10
+POINT_SHAPE <- 22
+POINT_STROKE <- 0.7
+
+TITLE_SIZE <- 18
+STRIP_SIZE <- 15
+AXIS_SIZE <- 13
+AXIS_TITLE_SIZE <- 13
+LEGEND_SIZE <- 12
+LEGEND_TITLE_SIZE <- 13
+
+cond_pal <- c(
+  "Critical" = "red4",
+  "Dry" = "red1",
+  "Below Normal" = "lightcoral",
+  "Above Normal" = "deepskyblue1",
+  "Wet" = "dodgerblue4"
+)
+
+
+# Build period-coded data
+bass_period_df <- striped_bass_all %>%
+  dplyr::mutate(
+    Period = dplyr::case_when(
+      Year >= 1969 & Year <= 1999 ~ "1969-1999",
+      Year >= 2000 & Year <= 2022 ~ "2000-2022",
+      TRUE ~ NA_character_
+    ),
+    Period = factor(Period, levels = c("1969-1999", "2000-2022")),
+    Condition = factor(Condition, levels = COND_LEVELS, ordered = TRUE)
+  ) %>%
+  dplyr::filter(!is.na(Period), !is.na(Value), !is.na(Condition))
+
+
+# Helper function
+# % difference from across-class average within each Activity x Period
+emm_pct_vs_avg_period <- function(dat) {
+  dat2 <- dat %>%
+    dplyr::filter(!is.na(Value), !is.na(Condition), !is.na(Year)) %>%
+    dplyr::mutate(
+      Condition = factor(Condition, levels = COND_LEVELS) |> forcats::fct_drop(),
+      Year = as.numeric(Year)
+    ) %>%
+    droplevels()
+
+  if (nrow(dat2) < 2L || length(levels(dat2$Condition)) < 2L) {
+    return(
+      tibble::tibble(
+        Condition = factor(COND_LEVELS, levels = COND_LEVELS, ordered = TRUE),
+        diff = NA_real_,
+        lcl = NA_real_,
+        ucl = NA_real_,
+        p_bh = NA_real_,
+        pct = NA_real_,
+        pcl = NA_real_,
+        pcu = NA_real_
+      )
+    )
+  }
+
+  mod <- stats::lm(Value ~ Condition + Year, data = dat2)
+
+  year_mean <- mean(dat2$Year, na.rm = TRUE)
+
+  em <- safe_emm(
+    mod,
+    ~ Condition,
+    at = list(Year = year_mean)
+  )
+
+  eff <- emmeans::contrast(em, "eff", adjust = "BH")
+  seff <- summary(eff, infer = TRUE)
+  sem <- summary(em)
+
+  lcl <- if ("lower.CL" %in% names(seff)) seff$lower.CL else seff$asymp.LCL
+  ucl <- if ("upper.CL" %in% names(seff)) seff$upper.CL else seff$asymp.UCL
+
+  gm <- mean(sem$emmean, na.rm = TRUE)
+  if (!is.finite(gm) || gm == 0) {
+    gm <- NA_real_
+  }
+
+  tibble::tibble(
+    Condition = factor(as.data.frame(em)$Condition, levels = COND_LEVELS, ordered = TRUE),
+    diff = seff$estimate,
+    lcl = lcl,
+    ucl = ucl,
+    p_bh = seff$p.value,
+    pct = 100 * diff / gm,
+    pcl = 100 * lcl / gm,
+    pcu = 100 * ucl / gm
+  ) %>%
+    dplyr::arrange(Condition)
+}
+```
+
+## WITHIN PERIOD SIGNIFICANCE TABLE FOR STRIPED BASS FIGURE 4: 
+
+```{r within-period significance for excel panels}
+# Within-period significance STRIPED BASS
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+
+# Helper function
+within_period_sig <- function(dat) {
+  
+  dat2 <- dat %>%
+    dplyr::filter(!is.na(Value), !is.na(Condition), !is.na(Year)) %>%
+    dplyr::mutate(
+      Condition = factor(Condition, levels = COND_LEVELS) |> forcats::fct_drop(),
+      Year = as.numeric(Year)
+    )
+  
+  if (nrow(dat2) < 2 || length(unique(dat2$Condition)) < 2) {
+    return(NULL)
+  }
+  
+# Model
+  mod <- lm(Value ~ Condition + Year, data = dat2)
+  
+  year_mean <- mean(dat2$Year, na.rm = TRUE)
+  
+# EMMs
+  em <- safe_emm(
+    mod,
+    ~ Condition,
+    at = list(Year = year_mean)
+  )
+  
+# "eff" = vs within-period mean
+  eff <- emmeans::contrast(em, "eff", adjust = "BH")
+  seff <- summary(eff, infer = TRUE)
+  sem  <- summary(em)
+  
+# CI columns
+  lcl <- if ("lower.CL" %in% names(seff)) seff$lower.CL else seff$asymp.LCL
+  ucl <- if ("upper.CL" %in% names(seff)) seff$upper.CL else seff$asymp.UCL
+  
+# grand mean
+  gm <- mean(sem$emmean, na.rm = TRUE)
+  
+  tibble::tibble(
+    Condition = factor(as.data.frame(em)$Condition, levels = COND_LEVELS, ordered = TRUE),
+    Estimate = seff$estimate,
+    CI_low = lcl,
+    CI_high = ucl,
+    pct = 100 * Estimate / gm,
+    pcl = 100 * CI_low / gm,
+    pcu = 100 * CI_high / gm,
+    p_bh = seff$p.value,
+    sig_0_01 = p_bh < 0.01
+  )
+}
+
+
+# Apply to each panel
+results_within_period <- dplyr::bind_rows(
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Age-0 Striped Bass", Year <= 1999) %>%
+    within_period_sig() %>%
+    dplyr::mutate(Activity = "Age-0", Period = "1969-1999"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Age-0 Striped Bass", Year >= 2000) %>%
+    within_period_sig() %>%
+    dplyr::mutate(Activity = "Age-0", Period = "2000-2022"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Adult Striped Bass", Year <= 1999) %>%
+    within_period_sig() %>%
+    dplyr::mutate(Activity = "Adult", Period = "1969-1999"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Adult Striped Bass", Year >= 2000) %>%
+    within_period_sig() %>%
+    dplyr::mutate(Activity = "Adult", Period = "2000-2022")
+
+) %>%
+  dplyr::arrange(Activity, Period, Condition)
+
+
+# Clean table 
+results_within_period_table <- results_within_period %>%
+  dplyr::mutate(
+    Estimate_fmt = paste0(
+      sprintf("%.1f", pct), "%",
+      dplyr::case_when(
+        sig_0_01 ~ " *",
+        TRUE ~ ""
+      )
+    ),
+
+    Range = paste0(
+      sprintf("%.1f", pcl), "%, ",
+      sprintf("%.1f", pcu), "%"
+    ),
+
+    p_bh = dplyr::case_when(
+      is.na(p_bh) ~ "—",
+      p_bh < 0.0001 ~ "<0.0001",
+      TRUE ~ sprintf("%.4f", p_bh)
+    )
+  ) %>%
+  dplyr::select(
+    Activity,
+    Period,
+    Condition,
+    Estimate = Estimate_fmt,
+    Range,
+    p_bh
+  )
+
+exists("safe_emm")
+exists("vcovHC_psd")
+exists("striped_bass_all")
+
+# SUPPLEMENTARY TABLE 1: ESTIMATES FOR STRIPED BASS
+results_within_period_table
+```
+## -------------Supplementary FIGURE NOT in PAPER------------------
+
+```{r test between extremes Dry and Wet}
+
+# Extreme swing analysis (Wet vs Critical)
+extreme_swing <- function(dat) {
+  
+  dat2 <- dat %>%
+    dplyr::filter(!is.na(Value), !is.na(Condition), !is.na(Year)) %>%
+    dplyr::mutate(
+      Condition = factor(Condition,
+        levels = c("Critical","Dry","Below Normal","Above Normal","Wet")
+      )
+    )
+  
+  mod <- lm(Value ~ Condition + Year, data = dat2)
+  year_mean <- mean(dat2$Year, na.rm = TRUE)
+  
+  em <- emmeans::emmeans(mod, ~ Condition, at = list(Year = year_mean))
+  
+# Contrast: Wet - Critical
+  swing <- emmeans::contrast(
+    em,
+    list("Wet - Critical" = c(-1, 0, 0, 0, 1)),
+    adjust = "none"
+  )
+  
+  s <- summary(swing, infer = TRUE)
+  sem <- summary(em)
+  
+  lcl <- if ("lower.CL" %in% names(s)) s$lower.CL else s$asymp.LCL
+  ucl <- if ("upper.CL" %in% names(s)) s$upper.CL else s$asymp.UCL
+  
+  gm <- mean(sem$emmean, na.rm = TRUE)
+  
+  tibble::tibble(
+    Estimate = s$estimate,
+    CI_low = lcl,
+    CI_high = ucl,
+    pct = 100 * Estimate / gm,
+    pcl = 100 * CI_low / gm,
+    pcu = 100 * CI_high / gm,
+    p_value = s$p.value
+  )
+}
+
+
+#  activity + period
+swing_results <- dplyr::bind_rows(
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Age-0 Striped Bass", Year <= 1999) %>%
+    extreme_swing() %>%
+    dplyr::mutate(Activity = "Age-0", Period = "1969-1999"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Age-0 Striped Bass", Year >= 2000) %>%
+    extreme_swing() %>%
+    dplyr::mutate(Activity = "Age-0", Period = "2000-2022"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Adult Striped Bass", Year <= 1999) %>%
+    extreme_swing() %>%
+    dplyr::mutate(Activity = "Adult", Period = "1969-1999"),
+
+  striped_bass_all %>%
+    dplyr::filter(Activity == "Adult Striped Bass", Year >= 2000) %>%
+    extreme_swing() %>%
+    dplyr::mutate(Activity = "Adult", Period = "2000-2022")
+
+)
+
+## Kept here as supplementary
+# Companion figure:
+# Wet - Critical swing by period
+# This figure shows hydrologic responsiveness as the contrast
+# between Wet and Critical conditions within each period.
+# Positive values mean Wet years are higher than Critical years.
+
+swing_plot_df <- swing_results %>%
+  dplyr::mutate(
+    Activity = factor(
+      Activity,
+      levels = c("Age-0", "Adult")
+    ),
+    Period = factor(
+      Period,
+      levels = c("1969-1999", "2000-2022")
+    ),
+    panel = dplyr::case_when(
+      Activity == "Age-0" ~ "a) Age-0 striped bass",
+      Activity == "Adult" ~ "b) Adult striped bass",
+      TRUE ~ NA_character_
+    ),
+    panel = factor(
+      panel,
+      levels = c("a) Age-0 striped bass", "b) Adult striped bass")
+    ),
+    star = dplyr::if_else(!is.na(p_value) & p_value < 0.01, "*", ""),
+    y_star_raw = dplyr::if_else(
+      !is.na(pct) & pct >= 0,
+      pcu + 10,
+      pcl - 10
+    ),
+    y_star = y_star_raw
+  )
+
+period_pal <- c(
+  "1969-1999" = "gray55",
+  "2000-2022" = "gray80"
+)
+
+p_swing <- ggplot2::ggplot(
+  swing_plot_df,
+  ggplot2::aes(x = Period, y = pct)
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linewidth = 0.4,
+    colour = "grey50"
+  ) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = pcl, ymax = pcu),
+    width = 0.14,
+    linewidth = 0.6,
+    colour = "black"
+  ) +
+  ggplot2::geom_col(
+    ggplot2::aes(fill = Period),
+    width = 0.62,
+    colour = "black",
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_text(
+    data = dplyr::filter(swing_plot_df, star != ""),
+    ggplot2::aes(y = y_star, label = star),
+    colour = "black",
+    size = 8,
+    fontface = "bold"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = period_pal,
+    drop = FALSE,
+    name = "Period"
+  ) +
+  ggplot2::facet_wrap(~ panel, ncol = 2) +
+  ggplot2::labs(
+    title = "Wet–Critical difference (\"hydrologic swing\") by period\n(Wet minus Critical conditions)",
+    x = NULL,
+    y = "% difference vs within-period average"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_line(
+      linewidth = 0.35,
+      colour = "grey85"
+    ),
+    strip.text = ggplot2::element_text(
+      face = "bold",
+      size = 14,
+      colour = "gray15"
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 13,
+      colour = "gray20"
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 13,
+      colour = "gray20"
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 13,
+      colour = "gray20"
+    ),
+    legend.position = "bottom",
+    legend.title = ggplot2::element_text(size = 12),
+    legend.text = ggplot2::element_text(size = 11),
+    panel.spacing = grid::unit(14, "pt"),
+    plot.margin = grid::unit(c(16, 16, 16, 16), "pt"),
+    plot.title = ggplot2::element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 16
+    )
+  )
+
+p_swing
+swing_results
+
+
+```
+
+```{r audit}
+# =========================
+# STRIPED BASS MODEL AUDIT
+# =========================
+
+audit_bass_model <- function(dat, label) {
+
+  dat2 <- dat %>%
+    dplyr::filter(
+      !is.na(Value),
+      !is.na(Condition),
+      !is.na(Year)
+    ) %>%
+    dplyr::mutate(
+      Condition = factor(
+        Condition,
+        levels = COND_LEVELS
+      ) |> forcats::fct_drop()
+    )
+
+  mod <- lm(
+    Value ~ Condition + Year,
+    data = dat2
+  )
+
+  cook <- cooks.distance(mod)
+
+  tibble::tibble(
+    Model = label,
+    n = stats::nobs(mod),
+    n_conditions = nlevels(dat2$Condition),
+    R2 = summary(mod)$r.squared,
+    Adj_R2 = summary(mod)$adj.r.squared,
+    RMSE = sqrt(mean(residuals(mod)^2)),
+    Max_Leverage = max(hatvalues(mod), na.rm = TRUE),
+    Max_CooksD =
+      if (all(is.na(cook))) NA_real_
+      else max(cook, na.rm = TRUE),
+    Influential_Points =
+      if (all(is.na(cook))) NA_integer_
+      else sum(
+        cook > 4 / stats::nobs(mod),
+        na.rm = TRUE
+      )
+  )
+}
+
+bass_audit <- dplyr::bind_rows(
+
+  audit_bass_model(
+    striped_bass_all %>%
+      dplyr::filter(
+        Activity == "Age-0 Striped Bass",
+        Year <= 1999
+      ),
+    "Age-0 (1969-1999)"
+  ),
+
+  audit_bass_model(
+    striped_bass_all %>%
+      dplyr::filter(
+        Activity == "Age-0 Striped Bass",
+        Year >= 2000
+      ),
+    "Age-0 (2000-2022)"
+  ),
+
+  audit_bass_model(
+    striped_bass_all %>%
+      dplyr::filter(
+        Activity == "Adult Striped Bass",
+        Year <= 1999
+      ),
+    "Adult (1969-1999)"
+  ),
+
+  audit_bass_model(
+    striped_bass_all %>%
+      dplyr::filter(
+        Activity == "Adult Striped Bass",
+        Year >= 2000
+      ),
+    "Adult (2000-2022)"
+  )
+
+)
+
+bass_audit
+```

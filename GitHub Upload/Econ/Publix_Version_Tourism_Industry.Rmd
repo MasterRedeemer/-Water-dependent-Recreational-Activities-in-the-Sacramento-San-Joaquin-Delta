@@ -1,0 +1,691 @@
+---
+title: "Rec and Tourism Delta Public Version"
+author: "Isaac T. Sanchez"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## 1) Setup: 
+
+This public-facing workflow is shown in three chunks. Additional plots and analyses are omitted because they are still under development or depend on restricted materials. However, no credentials are required for public reproduction of this part as this repository uses local extract files rather than live API calls.
+
+The visitor-sector grouping was constructed to approximate methods described by Dean Runyan Associates (2024), *The Economic Impact of Travel in California*, prepared for Visit California.
+
+Excel table shows outputs deemed adequate for summaries of the Visitor Sector for our study: DOI:...
+
+Workflow made for significance testing FIGURE 5 in manuscript, supplemental materials not used marked at pane above chunk(s)
+
+```{r setup}
+
+library(dplyr)
+library(emmeans)
+library(forcats)
+library(ggplot2)
+library(patchwork)
+library(purrr)
+library(readxl)
+library(sandwich)
+library(stringr)
+library(tidyr)
+
+# Repo Inputs excel sheets in folder with this R-Project:
+# - Water Raw: Hydrology_By_Year_Weighted
+# - GDP by industry: GDP by Individual Industry
+Water_raw <- read_excel("Data//Hydrology_By_Year_Weighted.xlsx", sheet = 1)
+GDP_by_industry <- read_excel("Data//GDP by Individual Industry.xlsx", sheet =1)
+
+# Hydrology Year condition levels
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+# Color Palette
+cond_pal <- c(
+  "Critical" = "red4",
+  "Dry" = "red1",
+  "Below Normal" = "lightcoral",
+  "Above Normal" = "deepskyblue1",
+  "Wet" = "dodgerblue4"
+)
+
+# making sure data is masked to each county accordingly via FIPS:
+geo_fips <- c(
+  Sacramento = "06067",
+  Solano = "06095",
+  `Contra Costa` = "06013",
+  Yolo = "06113",
+  `San Joaquin` = "06077"
+)
+```
+
+## 2) Wrangling Data
+
+```{r wrangle}
+
+# Convert year columns to long format and keep non-missing values
+pick_col <- function(nms, patterns) {
+  idx <- purrr::map(patterns, ~ which(stringr::str_detect(tolower(nms), .x))) |>
+    unlist()
+  if (length(idx) == 0) NA_character_ else nms[idx[1]]
+}
+
+clean_desc <- function(x) {
+  stringr::str_squish(stringr::str_to_lower(x))
+}
+
+pull_line <- function(df, patterns) {
+  df %>%
+    dplyr::filter(stringr::str_detect(desc, paste0(patterns, collapse = "|"))) %>%
+    dplyr::group_by(GeoFIPS, GeoName, Year) %>%
+    dplyr::summarise(val_mil = sum(DataValue, na.rm = TRUE) / 1000, .groups = "drop")
+}
+
+# Join BEA and hydrology by year ------------------------------------------
+
+water_clean <- Water_raw |>
+  janitor::clean_names()
+
+names(water_clean)
+
+wy <- water_clean |>
+  dplyr::transmute(
+    Year = as.integer(.data[["year"]]),
+    Unimp_Runoff_Type = .data[["year_type_wy"]] |>
+      stringr::str_squish() |>
+      stringr::str_to_title()
+  ) |>
+  dplyr::mutate(
+    Unimp_Runoff_Type = factor(
+      Unimp_Runoff_Type,
+      levels = COND_LEVELS,
+      ordered = TRUE
+    )
+  )
+
+# GDP wide to long
+nms <- names(GDP_by_industry)
+geo_col <- pick_col(nms, c("^geo[_ -]?fips$", "^geofips$"))
+name_col <- pick_col(nms, c("^geo[_ -]?name$", "^geoname$"))
+desc_col <- pick_col(nms, c("^desc(ription)?$", "^line[_ -]?desc"))
+
+year_cols <- nms[stringr::str_detect(nms, "^(?:x)?(?:19|20)\\d{2}$")]
+
+gdp_long <- GDP_by_industry %>%
+  dplyr::rename(
+    GeoFIPS = dplyr::all_of(geo_col),
+    GeoName_raw = dplyr::all_of(name_col),
+    LineDescription = dplyr::all_of(desc_col)
+  ) %>%
+  tidyr::pivot_longer(
+    dplyr::all_of(year_cols),
+    names_to = "Year",
+    values_to = "DataValue"
+  ) %>%
+  dplyr::mutate(
+    Year = as.integer(stringr::str_replace(Year, "^x", "")),
+    GeoFIPS = as.character(GeoFIPS),
+    GeoName = stringr::str_remove(GeoName_raw, ",\\s*CA$"),
+    DataValue = suppressWarnings(as.numeric(DataValue)),
+    desc = clean_desc(LineDescription)
+  ) %>%
+  dplyr::filter(
+    !is.na(Year),
+    !is.na(DataValue),
+    GeoFIPS %in% unname(geo_fips)
+  ) %>%
+  dplyr::select(GeoFIPS, GeoName, Year, LineDescription, desc, DataValue)
+
+# Visitor-sector related naming patterns, carry-over methods from Dean Runyan Associates (2024)
+nm_af_sector <- "^accommodation and food services$"
+nm_aer_sector <- "^arts, entertainment, and recreation$"
+nm_foodstore <- "^food and beverage stores$"
+nm_gas <- "^gasoline stations$"
+nm_retail <- "^retail trade$"
+nm_clothing <- "^clothing and clothing accessories stores$"
+nm_sportbook <- "^sporting goods, hobby, musical instrument, and book stores$"
+nm_genmerch <- "^general merchandise stores$"
+nm_miscstore <- "^miscellaneous store retailers$"
+nm_air_sched <- "^scheduled passenger air transportation$"
+nm_air_supp <- "^support activities for air transportation$"
+nm_brewers <- "^breweries$|^wineries$|^distilleries$|^breweries, wineries, and distilleries$|^breweries, wineries, distilleries$"
+nm_travel_ag <- "^travel agencies$"
+nm_conventions <- "^convention and trade show organizers$"
+nm_transit_gp <- "^transit and ground passenger transportation$"
+nm_scenic <- "^scenic and sightseeing transportation$"
+nm_rail <- "^rail transportation$"
+nm_water <- "^water transportation$"
+nm_urban <- "^urban transit systems$"
+nm_interurban <- "^interurban and rural bus transportation$"
+nm_taxi <- "^taxi and limousine service$"
+nm_charter <- "^charter bus industry$"
+nm_car_rent <- "^passenger car rental$"
+nm_truck_rent <- "^truck, trailer, and rv rental and leasing$"
+nm_parking <- "^parking lots and garages$"
+nm_tour_ops <- "^tour operators$"
+
+AF <- pull_line(gdp_long, nm_af_sector) %>%
+  dplyr::rename(AccomFood = val_mil)
+
+AER <- pull_line(gdp_long, nm_aer_sector) %>%
+  dplyr::rename(ArtsEntRec = val_mil)
+
+LocalTrans <- dplyr::bind_rows(
+  pull_line(gdp_long, nm_transit_gp),
+  pull_line(gdp_long, nm_scenic),
+  pull_line(gdp_long, nm_rail),
+  pull_line(gdp_long, nm_water),
+  pull_line(gdp_long, nm_urban),
+  pull_line(gdp_long, nm_interurban),
+  pull_line(gdp_long, nm_taxi),
+  pull_line(gdp_long, nm_charter),
+  pull_line(gdp_long, nm_car_rent),
+  pull_line(gdp_long, nm_truck_rent),
+  pull_line(gdp_long, nm_parking),
+  pull_line(gdp_long, nm_tour_ops)
+) %>%
+  dplyr::group_by(GeoFIPS, GeoName, Year) %>%
+  dplyr::summarise(LocalTransport = sum(val_mil, na.rm = TRUE), .groups = "drop")
+
+FoodStores <- pull_line(gdp_long, nm_foodstore) %>%
+  dplyr::rename(FoodStores = val_mil)
+
+Gasoline <- pull_line(gdp_long, nm_gas) %>%
+  dplyr::rename(Gasoline = val_mil)
+
+RetailKeep <- dplyr::bind_rows(
+  pull_line(gdp_long, nm_clothing),
+  pull_line(gdp_long, nm_sportbook),
+  pull_line(gdp_long, nm_genmerch),
+  pull_line(gdp_long, nm_miscstore)
+) %>%
+  dplyr::group_by(GeoFIPS, GeoName, Year) %>%
+  dplyr::summarise(RetailKeep = sum(val_mil, na.rm = TRUE), .groups = "drop")
+
+RetailTotal <- pull_line(gdp_long, nm_retail) %>%
+  dplyr::rename(RetailTotal = val_mil)
+
+RetailTourism <- RetailTotal %>%
+  dplyr::full_join(FoodStores, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(Gasoline, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(RetailKeep, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::mutate(
+    RetailSales = dplyr::coalesce(
+      RetailKeep,
+      pmax(
+        dplyr::coalesce(RetailTotal, 0) -
+          dplyr::coalesce(FoodStores, 0) -
+          dplyr::coalesce(Gasoline, 0),
+        0
+      )
+    )
+  ) %>%
+  dplyr::select(GeoFIPS, GeoName, Year, RetailSales, FoodStores, Gasoline)
+
+AirTrans <- dplyr::bind_rows(
+  pull_line(gdp_long, nm_air_sched),
+  pull_line(gdp_long, nm_air_supp)
+) %>%
+  dplyr::group_by(GeoFIPS, GeoName, Year) %>%
+  dplyr::summarise(AirTransport = sum(val_mil, na.rm = TRUE), .groups = "drop")
+
+BeverageProd <- pull_line(gdp_long, nm_brewers) %>%
+  dplyr::rename(BeverageProd = val_mil)
+
+TravelServices <- dplyr::bind_rows(
+  pull_line(gdp_long, nm_travel_ag),
+  pull_line(gdp_long, nm_conventions)
+) %>%
+  dplyr::group_by(GeoFIPS, GeoName, Year) %>%
+  dplyr::summarise(TravelServices = sum(val_mil, na.rm = TRUE), .groups = "drop")
+
+# Aggregate regional yearly totals
+region_year <- AF %>%
+  dplyr::full_join(AER, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(LocalTrans, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(RetailTourism, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(AirTrans, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(BeverageProd, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::full_join(TravelServices, by = c("GeoFIPS", "GeoName", "Year")) %>%
+  dplyr::group_by(Year) %>%
+  dplyr::summarise(
+    AccomFood = sum(AccomFood, na.rm = TRUE),
+    ArtsEntRec = sum(ArtsEntRec, na.rm = TRUE),
+    LocalTransport = sum(LocalTransport, na.rm = TRUE),
+    RetailSales = sum(RetailSales, na.rm = TRUE),
+    FoodStores = sum(FoodStores, na.rm = TRUE),
+    Gasoline = sum(Gasoline, na.rm = TRUE),
+    AirTransport = sum(AirTransport, na.rm = TRUE),
+    BeverageProd = sum(BeverageProd, na.rm = TRUE),
+    TravelServices = sum(TravelServices, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Total = AccomFood + ArtsEntRec + LocalTransport + RetailSales +
+      FoodStores + Gasoline + AirTransport + BeverageProd + TravelServices
+  ) %>%
+  dplyr::left_join(wy, by = "Year")
+
+# Model inference:
+# Percent difference from long-run mean -----------------------------------
+
+overall_mean <- mean(region_year$Total, na.rm = TRUE)
+
+type_summary <- region_year |>
+  dplyr::group_by(Unimp_Runoff_Type) |>
+  dplyr::summarise(
+    pct_diff = 100 * (mean(Total, na.rm = TRUE) / overall_mean - 1),
+    .groups = "drop"
+  )
+
+
+```
+
+
+### 3) The two plots
+
+```{r plots}
+
+axis_text_size <- 14   
+axis_title_size <- 14
+axis_color <- "gray20" 
+
+# Plot A: by-year aggregate totals
+p1 <- ggplot2::ggplot(
+  region_year,
+  ggplot2::aes(x = factor(Year), y = Total, fill = Unimp_Runoff_Type)
+) +
+  ggplot2::geom_col(width = 0.8, colour = "gray15", linewidth = 0.15) +
+  ggplot2::scale_fill_manual(values = cond_pal, drop = FALSE, name = "") +
+  ggplot2::scale_y_continuous(
+    labels = \(x) paste0(x / 1000, "M"),
+    limits = c(0, 20000),
+    expand = ggplot2::expansion(mult = c(0, 0.05))
+  ) +
+  ggplot2::labs(
+    title = "Visitor-Related Earnings: Five-County Total by Year",
+    x = NULL,
+    y = "Millions of dollars"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+
+# AXES TEXT 
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1,
+      size = axis_text_size,
+      colour = axis_color
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = axis_text_size,
+      colour = axis_color
+    ),
+
+# AXES TITLES (match subtitle size)
+    axis.title.y = ggplot2::element_text(
+      size = axis_title_size,
+      colour = axis_color
+    ),
+
+# GRID cleanup
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor.x = ggplot2::element_blank(),
+    panel.grid.minor.y = ggplot2::element_blank(),
+
+# LEGEND (condition labels)
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.text = ggplot2::element_text(size = axis_text_size)
+  ) +
+  ggplot2::guides(fill = ggplot2::guide_legend(nrow = 1, byrow = TRUE))
+
+# Plot B: percent difference from the long-run mean
+p_type_pct_sig <- ggplot2::ggplot(
+  type_summary,
+  ggplot2::aes(x = Unimp_Runoff_Type, y = pct_diff, fill = Unimp_Runoff_Type)
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    colour = "gray35"
+  ) +
+  ggplot2::geom_col(
+    width = 0.75,
+    colour = "gray10",
+    linewidth = 0.3
+  ) +
+  ggplot2::scale_fill_manual(values = cond_pal, guide = "none") +
+  ggplot2::scale_y_continuous(
+    labels = \(x) paste0(round(x), "%"),
+    limits = c(-30, 30),
+    expand = ggplot2::expansion(mult = c(0.05, 0.08))
+  ) +
+  ggplot2::labs(
+    title = NULL,
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+
+    panel.border = ggplot2::element_rect(
+      colour = "gray20",
+      fill = NA,
+      linewidth = 0.6
+    ),
+
+    axis.ticks = ggplot2::element_blank(),
+
+    # AXIS TEXT (final adjustments)
+    axis.text.x = ggplot2::element_text(
+      size = axis_text_size,
+      colour = axis_color
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = axis_text_size,
+      colour = axis_color
+    )
+  )
+# Print plots
+p1
+p_type_pct_sig
+
+```
+
+
+```{r GDP significance}
+
+COND_LEVELS <- c("Critical", "Dry", "Below Normal", "Above Normal", "Wet")
+
+within_period_sig_gdp <- function(dat, period_label) {
+  dat2 <- dat |>
+    dplyr::filter(
+      !is.na(Total),
+      !is.na(Unimp_Runoff_Type),
+      !is.na(Year)
+    ) |>
+    dplyr::mutate(
+      Condition = factor(
+        Unimp_Runoff_Type,
+        levels = COND_LEVELS,
+        ordered = TRUE
+      ) |>
+        forcats::fct_drop(),
+      Year = as.numeric(Year)
+    )
+
+  condition_counts <- dat2 |>
+    dplyr::count(Condition, name = "n_years")
+
+  dat2 <- dat2 |>
+    dplyr::semi_join(
+      condition_counts |> dplyr::filter(n_years >= 2),
+      by = "Condition"
+    ) |>
+    droplevels()
+
+  if (nrow(dat2) < 4 || dplyr::n_distinct(dat2$Condition) < 2) {
+    return(
+      tibble::tibble(
+        Period = period_label,
+        Condition = factor(COND_LEVELS, levels = COND_LEVELS, ordered = TRUE),
+        Estimate = NA_real_,
+        CI_low = NA_real_,
+        CI_high = NA_real_,
+        pct = NA_real_,
+        pcl = NA_real_,
+        pcu = NA_real_,
+        p_bh = NA_real_,
+        sig_0_01 = FALSE,
+        sig_0_05 = FALSE,
+        note = "Skipped: too few observations per hydrology class"
+      )
+    )
+  }
+
+  mod <- stats::lm(Total ~ Condition + Year, data = dat2)
+
+  hat_max <- max(stats::hatvalues(mod), na.rm = TRUE)
+
+  if (hat_max >= 0.999) {
+    return(
+      tibble::tibble(
+        Period = period_label,
+        Condition = factor(COND_LEVELS, levels = COND_LEVELS, ordered = TRUE),
+        Estimate = NA_real_,
+        CI_low = NA_real_,
+        CI_high = NA_real_,
+        pct = NA_real_,
+        pcl = NA_real_,
+        pcu = NA_real_,
+        p_bh = NA_real_,
+        sig_0_01 = FALSE,
+        sig_0_05 = FALSE,
+        note = "Skipped: HC3 unstable because leverage is near 1"
+      )
+    )
+  }
+
+year_mean <- mean(dat2$Year, na.rm = TRUE)
+
+# HC3 robust covariance matrix
+vc <- sandwich::vcovHC(
+  mod,
+  type = "HC3"
+)
+
+# Estimated marginal means evaluated at the average year
+em <- emmeans::emmeans(
+  mod,
+  ~ Condition,
+  at = list(Year = year_mean),
+  vcov. = vc
+)
+
+  eff <- emmeans::contrast(em, "eff", adjust = "BH")
+  seff <- summary(eff, infer = TRUE)
+  sem <- summary(em)
+
+  lcl <- if ("lower.CL" %in% names(seff)) seff$lower.CL else seff$asymp.LCL
+  ucl <- if ("upper.CL" %in% names(seff)) seff$upper.CL else seff$asymp.UCL
+
+  gm <- mean(sem$emmean, na.rm = TRUE)
+
+  tibble::tibble(
+    Period = period_label,
+    Condition = factor(
+      as.data.frame(em)$Condition,
+      levels = COND_LEVELS,
+      ordered = TRUE
+    ),
+    Estimate = seff$estimate,
+    CI_low = lcl,
+    CI_high = ucl,
+    pct = 100 * Estimate / gm,
+    pcl = 100 * CI_low / gm,
+    pcu = 100 * CI_high / gm,
+    p_bh = seff$p.value,
+    sig_0_01 = p_bh < 0.01,
+    sig_0_05 = p_bh < 0.05,
+    note = NA_character_
+  )
+}
+
+gdp_sig_results <- dplyr::bind_rows(
+  within_period_sig_gdp(
+    region_year |> dplyr::filter(Year <= 2009),
+    "Pre-2010"
+  ),
+  within_period_sig_gdp(
+    region_year |> dplyr::filter(Year >= 2010),
+    "Post-2010"
+  ),
+  within_period_sig_gdp(
+    region_year,
+    "Full period"
+  )
+) |>
+  dplyr::arrange(Period, Condition)
+
+gdp_sig_table <- gdp_sig_results |>
+  dplyr::mutate(
+    Estimate_fmt = dplyr::if_else(
+      is.na(pct),
+      NA_character_,
+      paste0(
+        sprintf("%.1f", pct),
+        "%",
+        dplyr::case_when(
+          sig_0_01 ~ " *",
+          TRUE ~ ""
+        )
+      )
+    ),
+    Range = dplyr::if_else(
+      is.na(pcl) | is.na(pcu),
+      NA_character_,
+      paste0(
+        sprintf("%.1f", pcl),
+        "%, ",
+        sprintf("%.1f", pcu),
+        "%"
+      )
+    )
+  ) |>
+  dplyr::select(
+    Period,
+    Condition,
+    Estimate = Estimate_fmt,
+    Range,
+    p_bh,
+    note
+  )
+
+gdp_sig_table
+```
+
+```{r sector-share-table}
+
+# Visitor sector composition (% of total) by year
+# Built directly from BEA aggregation (see wrangle chunk above)
+
+sector_share <- region_year %>%
+  dplyr::select(
+    Year,
+    AccomFood,
+    ArtsEntRec,
+    LocalTransport,
+    RetailSales,
+    FoodStores,
+    Gasoline,
+    AirTransport,
+    BeverageProd,
+    TravelServices,
+    Total
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      -c(Year, Total),
+      ~ 100 * (.x / Total)
+    )
+  ) %>%
+  dplyr::select(-Total) %>%
+  dplyr::arrange(Year)
+
+# Clean names 
+sector_share_clean <- sector_share %>%
+  dplyr::rename(
+    `Accommodation & Food` = AccomFood,
+    `Arts, Entertainment, Recreation` = ArtsEntRec,
+    `Local Transport` = LocalTransport,
+    `Retail (Tourism-related)` = RetailSales,
+    `Food Stores` = FoodStores,
+    `Gasoline` = Gasoline,
+    `Air Transport` = AirTransport,
+    `Beverage Production` = BeverageProd,
+    `Travel Services` = TravelServices
+  )
+
+# round up for legibility
+sector_share_clean <- sector_share_clean %>%
+  dplyr::mutate(
+    dplyr::across(-Year, ~ round(.x, 1))
+  )
+
+# PERCENT SHARE USED FOR FIGURE 5 AND DISCUSSION SECTION 
+sector_share_clean
+```
+
+```{r audit}
+# =========================
+# BEA GDP MODEL AUDIT
+# =========================
+
+COND_LEVELS <- c(
+  "Critical",
+  "Dry",
+  "Below Normal",
+  "Above Normal",
+  "Wet"
+)
+
+audit_bea_model <- function(dat, label) {
+
+  dat2 <- dat %>%
+    dplyr::filter(
+      !is.na(Total),
+      !is.na(Unimp_Runoff_Type),
+      !is.na(Year)
+    ) %>%
+    dplyr::mutate(
+      Condition = factor(
+        Unimp_Runoff_Type,
+        levels = COND_LEVELS
+      ) |>
+        forcats::fct_drop()
+    )
+
+  mod <- stats::lm(
+    Total ~ Condition + Year,
+    data = dat2
+  )
+
+  tibble::tibble(
+    Model = label,
+    n = stats::nobs(mod),
+    n_conditions = nlevels(dat2$Condition),
+    R2 = summary(mod)$r.squared,
+    Adj_R2 = summary(mod)$adj.r.squared,
+    RMSE = sqrt(mean(residuals(mod)^2)),
+    Max_Leverage = max(hatvalues(mod)),
+    Max_CooksD = max(cooks.distance(mod)),
+    Influential_Points = sum(
+      cooks.distance(mod) > 4 / stats::nobs(mod)
+    )
+  )
+}
+
+bea_audit <- dplyr::bind_rows(
+
+  audit_bea_model(
+    region_year,
+    "Full Period"
+  ),
+
+  audit_bea_model(
+    region_year %>%
+      dplyr::filter(Year <= 2009),
+    "Pre-2010"
+  ),
+
+  audit_bea_model(
+    region_year %>%
+      dplyr::filter(Year >= 2010),
+    "Post-2010"
+  )
+
+)
+
+bea_audit
+```
